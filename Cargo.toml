@@ -1,0 +1,18 @@
+[package]
+name = "redb-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+redb = "4"
+clap = { version = "4", features = ["derive"] }
+rustyline = "18"
+thiserror = "2"
+unicode-width = "0.2"
+
+[profile.release]
+strip = "symbols"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
