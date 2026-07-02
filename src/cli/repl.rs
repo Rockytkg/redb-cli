@@ -155,6 +155,19 @@ impl Repl {
                     }
                 }
             }
+            ".compact" => {
+                if !self.session.is_open() {
+                    eprintln!("未打开数据库。");
+                    return;
+                }
+                match self.session.db_mut() {
+                    Ok(db) => match crate::engine::meta::execute_compact(db) {
+                        Ok(r) => println!("{}", crate::engine::display::render_table(&r)),
+                        Err(e) => eprintln!("压缩错误: {}", e),
+                    },
+                    Err(e) => eprintln!("错误: {}", e),
+                }
+            }
             ".help" => {
                 Executor::print_help_static();
             }

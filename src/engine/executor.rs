@@ -23,7 +23,7 @@ impl Executor {
                 Ok(())
             }
             Statement::DotCompact { output_mode } => {
-                let db = session.db()?;
+                let db = session.db_mut()?;
                 let r = meta::execute_compact(db)?;
                 println!("{}", render_result(&r, *output_mode));
                 Ok(())

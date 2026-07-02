@@ -47,6 +47,10 @@ impl Session {
         self.db.as_ref().ok_or(CliError::NoDatabase)
     }
 
+    pub fn db_mut(&mut self) -> CliResult<&mut Database> {
+        self.db.as_mut().ok_or(CliError::NoDatabase)
+    }
+
     /// 返回仅文件名的提示符字符串
     pub fn prompt_name(&self) -> String {
         self.path

@@ -5,3 +5,4 @@ pub mod meta;
 pub mod mutate;
 pub mod query;
 pub mod session;
+pub mod types;

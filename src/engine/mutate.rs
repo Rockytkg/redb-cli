@@ -1,9 +1,23 @@
+//! 数据变更 (INSERT / DELETE)。
+//!
+//! 类型覆盖策略：
+//! - `&str`/`&[u8]` 键值因 HRTB+生命周期约束需专用函数处理
+//! - 自有类型通过 `OwnedFromLit` trait + `for_all_owned_table_types!` 宏统一分派
+//! - 两者合计覆盖 `for_all_table_types!` 中的全部组合
+
 use redb::{Database, Key, TableDefinition, Value, WriteTransaction};
 use std::borrow::Borrow;
 
 use crate::engine::query::QueryResult;
 use crate::error::{CliError, CliResult};
 use crate::parser::ast::Literal;
+use crate::for_all_owned_table_types;
+
+// ── OwnedFromLit: Literal → 自有类型转换 ─────────────────────────────────
+
+trait OwnedFromLit: Sized + 'static {
+    fn from_lit(lit: &Literal) -> Option<Self>;
+}
 
 fn lit_to_string(v: &Literal) -> String {
     match v {
@@ -13,7 +27,8 @@ fn lit_to_string(v: &Literal) -> String {
         Literal::Null => String::new(),
     }
 }
-fn to_i64(v: &Literal) -> Option<i64> {
+
+fn lit_to_i64(v: &Literal) -> Option<i64> {
     match v {
         Literal::Int(i) => Some(*i),
         Literal::Float(f) => Some(*f as i64),
@@ -21,7 +36,8 @@ fn to_i64(v: &Literal) -> Option<i64> {
         Literal::Null => Some(0),
     }
 }
-fn to_u64(v: &Literal) -> Option<u64> {
+
+fn lit_to_u64(v: &Literal) -> Option<u64> {
     match v {
         Literal::Int(i) if *i >= 0 => Some(*i as u64),
         Literal::Float(f) if *f >= 0.0 => Some(*f as u64),
@@ -31,412 +47,339 @@ fn to_u64(v: &Literal) -> Option<u64> {
     }
 }
 
-/// 执行 INSERT。依次尝试常见类型组合，命中即停。
-pub fn execute_insert(
-    db: &Database,
-    table_name: &str,
-    key: &Literal,
-    value: &Literal,
-) -> CliResult<QueryResult> {
-    execute_insert_inner(WriteTarget::Database(db), table_name, key, value)
+fn lit_to_f64(v: &Literal) -> Option<f64> {
+    match v {
+        Literal::Int(i) => Some(*i as f64),
+        Literal::Float(f) => Some(*f),
+        Literal::String(s) => s.parse().ok(),
+        Literal::Null => Some(0.0),
+    }
 }
 
-pub fn execute_insert_in_txn(
-    txn: &WriteTransaction,
-    table_name: &str,
-    key: &Literal,
-    value: &Literal,
-) -> CliResult<QueryResult> {
+fn lit_to_bool(v: &Literal) -> Option<bool> {
+    match v {
+        Literal::Int(0) => Some(false),
+        Literal::Int(_) => Some(true),
+        Literal::Float(f) if *f == 0.0 => Some(false),
+        Literal::Float(_) => Some(true),
+        Literal::String(s) => match s.to_lowercase().as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" | "" => Some(false),
+            _ => None,
+        },
+        Literal::Null => Some(false),
+    }
+}
+
+impl OwnedFromLit for String { fn from_lit(l: &Literal) -> Option<Self> { Some(lit_to_string(l)) } }
+impl OwnedFromLit for i64 { fn from_lit(l: &Literal) -> Option<Self> { lit_to_i64(l) } }
+impl OwnedFromLit for u64 { fn from_lit(l: &Literal) -> Option<Self> { lit_to_u64(l) } }
+impl OwnedFromLit for f64 { fn from_lit(l: &Literal) -> Option<Self> { lit_to_f64(l) } }
+impl OwnedFromLit for bool { fn from_lit(l: &Literal) -> Option<Self> { lit_to_bool(l) } }
+impl OwnedFromLit for i32 { fn from_lit(l: &Literal) -> Option<Self> { lit_to_i64(l).map(|v| v as i32) } }
+impl OwnedFromLit for u32 { fn from_lit(l: &Literal) -> Option<Self> { lit_to_u64(l).map(|v| v as u32) } }
+impl OwnedFromLit for f32 { fn from_lit(l: &Literal) -> Option<Self> { lit_to_f64(l).map(|v| v as f32) } }
+impl OwnedFromLit for i128 { fn from_lit(l: &Literal) -> Option<Self> {
+    match l { Literal::Int(i) => Some(*i as i128), Literal::Float(f) => Some(*f as i128), Literal::String(s) => s.parse().ok(), Literal::Null => Some(0) }
+}}
+impl OwnedFromLit for u128 { fn from_lit(l: &Literal) -> Option<Self> {
+    match l { Literal::Int(i) if *i >= 0 => Some(*i as u128), Literal::Float(f) if *f >= 0.0 => Some(*f as u128), Literal::String(s) => s.parse().ok(), Literal::Null => Some(0), _ => None }
+}}
+impl OwnedFromLit for i16 { fn from_lit(l: &Literal) -> Option<Self> { lit_to_i64(l).map(|v| v as i16) } }
+impl OwnedFromLit for u16 { fn from_lit(l: &Literal) -> Option<Self> { lit_to_u64(l).map(|v| v as u16) } }
+impl OwnedFromLit for i8 { fn from_lit(l: &Literal) -> Option<Self> { lit_to_i64(l).map(|v| v as i8) } }
+impl OwnedFromLit for u8 { fn from_lit(l: &Literal) -> Option<Self> { lit_to_u64(l).map(|v| v as u8) } }
+
+// ── INSERT ────────────────────────────────────────────────────────────────
+
+pub fn execute_insert(db: &Database, table_name: &str, key: &Literal, value: &Literal) -> CliResult<QueryResult> {
+    execute_insert_inner(WriteTarget::Database(db), table_name, key, value)
+}
+pub fn execute_insert_in_txn(txn: &WriteTransaction, table_name: &str, key: &Literal, value: &Literal) -> CliResult<QueryResult> {
     execute_insert_inner(WriteTarget::Transaction(txn), table_name, key, value)
 }
 
-fn execute_insert_inner(
-    target: WriteTarget<'_>,
-    table_name: &str,
-    key: &Literal,
-    value: &Literal,
-) -> CliResult<QueryResult> {
+fn execute_insert_inner(target: WriteTarget<'_>, table_name: &str, key: &Literal, value: &Literal) -> CliResult<QueryResult> {
     let sk = lit_to_string(key);
     let sv = lit_to_string(value);
 
-    // ── &str 键 (redb 4.x 新增) ──
-    if let Some(v) = to_i64(value) {
-        if_ok!(target.try_insert_str_key(table_name, sk.as_str(), &v));
-    }
-    if let Some(v) = to_u64(value) {
-        if_ok!(target.try_insert_str_key(table_name, sk.as_str(), &v));
-    }
-    if_ok!(target.try_insert_str_key_str_val(table_name, sk.as_str(), sv.as_str()));
+    if let Some(r) = try_insert_str_key(target, table_name, sk.as_str(), value, &sv) { return r; }
+    if let Some(r) = try_insert_bytes_key(target, table_name, sk.as_bytes(), value, &sv) { return r; }
+    if let Some(r) = try_insert_owned_key_ref_val(target, table_name, key, value, &sv) { return r; }
 
-    // ── String 键 ──
-    if let Some(v) = to_i64(value) {
-        if_ok!(target.try_insert::<String, i64>(table_name, &sk, &v));
+    macro_rules! try_insert {
+        ($K:ty, $V:ty) => {
+            if let (Some(k), Some(v)) = (<$K as OwnedFromLit>::from_lit(key), <$V as OwnedFromLit>::from_lit(value)) {
+                if_ok!(target.try_insert::<$K, $V>(table_name, &k, &v));
+            }
+        };
     }
-    if let Some(v) = to_u64(value) {
-        if_ok!(target.try_insert::<String, u64>(table_name, &sk, &v));
-    }
-    if_ok!(target.try_insert::<String, String>(table_name, &sk, &sv));
-    {
-        let b = matches!(value, Literal::Int(i) if *i != 0);
-        if_ok!(target.try_insert::<String, bool>(table_name, &sk, &b));
-    }
-    if let Literal::Float(f) = value {
-        if_ok!(target.try_insert::<String, f64>(table_name, &sk, f));
-    }
-    // String 键 × &str 值
-    if_ok!(target.try_insert_str_val::<String>(table_name, &sk, &sv));
+    for_all_owned_table_types!(try_insert);
 
-    // ── i64 键 ──
-    if let Some(k) = to_i64(key) {
-        if let Some(v) = to_i64(value) {
-            if_ok!(target.try_insert::<i64, i64>(table_name, &k, &v));
-        }
-        if let Some(v) = to_u64(value) {
-            if_ok!(target.try_insert::<i64, u64>(table_name, &k, &v));
-        }
-        if_ok!(target.try_insert::<i64, String>(table_name, &k, &sv));
-        if_ok!(target.try_insert_str_val::<i64>(table_name, &k, &sv));
-    }
-
-    // ── u64 键 ──
-    if let Some(k) = to_u64(key) {
-        if let Some(v) = to_u64(value) {
-            if_ok!(target.try_insert::<u64, u64>(table_name, &k, &v));
-        }
-        if let Some(v) = to_i64(value) {
-            if_ok!(target.try_insert::<u64, i64>(table_name, &k, &v));
-        }
-        if_ok!(target.try_insert::<u64, String>(table_name, &k, &sv));
-        if_ok!(target.try_insert_str_val::<u64>(table_name, &k, &sv));
-    }
-
-    Err(CliError::Engine(format!(
-        "无法插入数据到 '{}'。请使用 DESCRIBE 查看表结构。",
-        table_name
-    )))
+    Err(CliError::Engine(format!("无法插入数据到 '{}'。请使用 DESCRIBE 查看表结构。", table_name)))
 }
+
+// ── INSERT: &str 键专用 ──
+
+fn try_insert_str_key(target: WriteTarget<'_>, table_name: &str, key: &str, value: &Literal, sv: &str) -> Option<CliResult<QueryResult>> {
+    macro_rules! try_v { ($V:ty) => {
+        if let Some(v) = <$V as OwnedFromLit>::from_lit(value) {
+            if let Ok(r) = insert_str_key_val::<$V>(target, table_name, key, &v) { return Some(Ok(r)); }
+        }
+    }}
+    try_v!(i64); try_v!(u64); try_v!(f64); try_v!(bool);
+    try_v!(i32); try_v!(u32); try_v!(f32);
+    try_v!(i128); try_v!(u128);
+    try_v!(i16); try_v!(u16); try_v!(i8); try_v!(u8);
+    try_v!(String);
+
+    if let Ok(r) = insert_str_str(target, table_name, key, sv) { return Some(Ok(r)); }
+    if let Ok(r) = insert_str_bytes(target, table_name, key, sv.as_bytes()) { return Some(Ok(r)); }
+    None
+}
+
+// ── INSERT: &[u8] 键专用 ──
+
+fn try_insert_bytes_key(target: WriteTarget<'_>, table_name: &str, key: &[u8], value: &Literal, sv: &str) -> Option<CliResult<QueryResult>> {
+    if let Ok(r) = insert_bytes_bytes(target, table_name, key, sv.as_bytes()) { return Some(Ok(r)); }
+    if let Ok(r) = insert_bytes_str(target, table_name, key, sv) { return Some(Ok(r)); }
+    if let Ok(r) = insert_bytes_key_val::<String>(target, table_name, key, &sv.to_string()) { return Some(Ok(r)); }
+    if let Some(v) = lit_to_i64(value) { if let Ok(r) = insert_bytes_key_val::<i64>(target, table_name, key, &v) { return Some(Ok(r)); } }
+    if let Some(v) = lit_to_u64(value) { if let Ok(r) = insert_bytes_key_val::<u64>(target, table_name, key, &v) { return Some(Ok(r)); } }
+    None
+}
+
+// ── INSERT: 自有键 × 引用值 ──
+
+fn try_insert_owned_key_ref_val(target: WriteTarget<'_>, table_name: &str, key: &Literal, value: &Literal, sv: &str) -> Option<CliResult<QueryResult>> {
+    if !matches!(value, Literal::String(_)) { return None; }
+    macro_rules! try_k { ($K:ty) => {
+        if let Some(k) = <$K as OwnedFromLit>::from_lit(key) {
+            if let Ok(r) = insert_owned_str(target, table_name, &k, sv) { return Some(Ok(r)); }
+            if let Ok(r) = insert_owned_bytes(target, table_name, &k, sv.as_bytes()) { return Some(Ok(r)); }
+        }
+    }}
+    try_k!(String); try_k!(i64); try_k!(u64);
+    try_k!(i32); try_k!(u32); try_k!(bool);
+    try_k!(i128); try_k!(u128); try_k!(i16); try_k!(i8);
+    None
+}
+
+// ── WriteTarget ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
-enum WriteTarget<'a> {
-    Database(&'a Database),
-    Transaction(&'a WriteTransaction),
-}
+enum WriteTarget<'a> { Database(&'a Database), Transaction(&'a WriteTransaction) }
 
 impl WriteTarget<'_> {
-    fn try_insert<K, V>(self, table: &str, k: &K, v: &V) -> CliResult<QueryResult>
-    where
-        K: Key + 'static,
-        V: Value + 'static,
-        for<'a> &'a K: Borrow<<K as Value>::SelfType<'a>>,
-        for<'a> &'a V: Borrow<<V as Value>::SelfType<'a>>,
+    fn try_insert<K: Key + 'static, V: Value + 'static>(self, table: &str, k: &K, v: &V) -> CliResult<QueryResult>
+    where for<'a> &'a K: Borrow<<K as Value>::SelfType<'a>>, for<'a> &'a V: Borrow<<V as Value>::SelfType<'a>>,
     {
         match self {
-            WriteTarget::Database(db) => {
-                let txn = db.begin_write()?;
-                let result = insert_on_txn::<K, V>(&txn, table, k, v);
-                finish_auto_txn(txn, result)
-            }
-            WriteTarget::Transaction(txn) => insert_on_txn::<K, V>(txn, table, k, v),
+            WriteTarget::Database(db) => { let txn = db.begin_write()?; let r = insert_txn::<K, V>(&txn, table, k, v); finish(txn, r) }
+            WriteTarget::Transaction(txn) => insert_txn::<K, V>(txn, table, k, v),
         }
     }
-
-    fn try_insert_str_val<K: Key + 'static>(
-        self,
-        table: &str,
-        k: &K,
-        v: &str,
-    ) -> CliResult<QueryResult>
-    where
-        for<'a> &'a K: Borrow<<K as Value>::SelfType<'a>>,
+    fn try_delete<K: Key + 'static, V: Value + 'static>(self, table: &str, key: &K) -> CliResult<QueryResult>
+    where for<'a> &'a K: Borrow<<K as Value>::SelfType<'a>>,
     {
         match self {
-            WriteTarget::Database(db) => {
-                let txn = db.begin_write()?;
-                let result = insert_str_val_on_txn::<K>(&txn, table, k, v);
-                finish_auto_txn(txn, result)
-            }
-            WriteTarget::Transaction(txn) => insert_str_val_on_txn::<K>(txn, table, k, v),
-        }
-    }
-
-    fn try_insert_str_key<V: Value + 'static>(
-        self,
-        table: &str,
-        key: &str,
-        v: &V,
-    ) -> CliResult<QueryResult>
-    where
-        for<'a> &'a V: Borrow<<V as Value>::SelfType<'a>>,
-    {
-        match self {
-            WriteTarget::Database(db) => {
-                let txn = db.begin_write()?;
-                let result = insert_str_key_on_txn::<V>(&txn, table, key, v);
-                finish_auto_txn(txn, result)
-            }
-            WriteTarget::Transaction(txn) => insert_str_key_on_txn::<V>(txn, table, key, v),
-        }
-    }
-
-    fn try_insert_str_key_str_val(
-        self,
-        table: &str,
-        key: &str,
-        val: &str,
-    ) -> CliResult<QueryResult> {
-        match self {
-            WriteTarget::Database(db) => {
-                let txn = db.begin_write()?;
-                let result = insert_str_key_str_val_on_txn(&txn, table, key, val);
-                finish_auto_txn(txn, result)
-            }
-            WriteTarget::Transaction(txn) => insert_str_key_str_val_on_txn(txn, table, key, val),
+            WriteTarget::Database(db) => { let txn = db.begin_write()?; let r = delete_txn::<K, V>(&txn, table, key); finish(txn, r) }
+            WriteTarget::Transaction(txn) => delete_txn::<K, V>(txn, table, key),
         }
     }
 }
 
-fn finish_auto_txn(
-    txn: WriteTransaction,
-    result: CliResult<QueryResult>,
-) -> CliResult<QueryResult> {
-    match result {
-        Ok(result) => {
-            txn.commit()?;
-            Ok(result)
-        }
-        Err(err) => {
-            txn.abort()?;
-            Err(err)
-        }
-    }
+fn finish(txn: WriteTransaction, r: CliResult<QueryResult>) -> CliResult<QueryResult> {
+    match r { Ok(q) => { txn.commit()?; Ok(q) } Err(e) => { txn.abort()?; Err(e) } }
 }
 
-// ── 泛型 INSERT 辅助函数 ──
-
-fn insert_on_txn<K, V>(txn: &WriteTransaction, table: &str, k: &K, v: &V) -> CliResult<QueryResult>
-where
-    K: Key + 'static,
-    V: Value + 'static,
-    for<'a> &'a K: Borrow<<K as Value>::SelfType<'a>>,
-    for<'a> &'a V: Borrow<<V as Value>::SelfType<'a>>,
+fn insert_txn<K: Key + 'static, V: Value + 'static>(txn: &WriteTransaction, table: &str, k: &K, v: &V) -> CliResult<QueryResult>
+where for<'a> &'a K: Borrow<<K as Value>::SelfType<'a>>, for<'a> &'a V: Borrow<<V as Value>::SelfType<'a>>,
 {
     let def = TableDefinition::<K, V>::new(table);
-    let mut t = txn
-        .open_table(def)
-        .map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?;
+    let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?;
     t.insert(k, v)?;
-    Ok(QueryResult::with_message(format!(
-        "已插入 1 行到 '{}'。",
-        table
-    )))
+    Ok(QueryResult::with_message(format!("已插入 1 行到 '{}'。", table)))
 }
 
-/// 值类型为 &str 的 INSERT
-fn insert_str_val_on_txn<K: Key + 'static>(
-    txn: &WriteTransaction,
-    table: &str,
-    k: &K,
-    v: &str,
-) -> CliResult<QueryResult>
-where
-    for<'a> &'a K: Borrow<<K as Value>::SelfType<'a>>,
+// ── 引用类型专用 INSERT（绕过 HRTB 生命周期约束）──
+
+fn insert_str_key_val<V: Value + 'static>(target: WriteTarget<'_>, table: &str, key: &str, v: &V) -> CliResult<QueryResult>
+where for<'a> &'a V: Borrow<<V as Value>::SelfType<'a>>,
 {
-    let def = TableDefinition::<K, &str>::new(table);
-    let mut t = txn
-        .open_table(def)
-        .map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?;
-    t.insert(k, v)?;
-    Ok(QueryResult::with_message(format!(
-        "已插入 1 行到 '{}'。",
-        table
-    )))
+    match target {
+        WriteTarget::Database(db) => { let txn = db.begin_write()?; let r = insert_str_key_val_txn::<V>(&txn, table, key, v); finish(txn, r) }
+        WriteTarget::Transaction(txn) => insert_str_key_val_txn::<V>(txn, table, key, v),
+    }
 }
-
-/// 键类型为 &str 的 INSERT（redb 4.x 新增能力）
-fn insert_str_key_on_txn<V: Value + 'static>(
-    txn: &WriteTransaction,
-    table: &str,
-    key: &str,
-    v: &V,
-) -> CliResult<QueryResult>
-where
-    for<'a> &'a V: Borrow<<V as Value>::SelfType<'a>>,
+fn insert_str_key_val_txn<V: Value + 'static>(txn: &WriteTransaction, table: &str, key: &str, v: &V) -> CliResult<QueryResult>
+where for<'a> &'a V: Borrow<<V as Value>::SelfType<'a>>,
 {
     let def = TableDefinition::<&str, V>::new(table);
-    let mut t = txn
-        .open_table(def)
-        .map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?;
+    let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?;
     t.insert(key, v)?;
-    Ok(QueryResult::with_message(format!(
-        "已插入 1 行到 '{}'。",
-        table
-    )))
+    Ok(QueryResult::with_message(format!("已插入 1 行到 '{}'。", table)))
 }
 
-/// 键值均为 &str 的 INSERT（redb 4.x 新增能力）
-fn insert_str_key_str_val_on_txn(
-    txn: &WriteTransaction,
-    table: &str,
-    key: &str,
-    val: &str,
-) -> CliResult<QueryResult> {
-    let def = TableDefinition::<&str, &str>::new(table);
-    let mut t = txn
-        .open_table(def)
-        .map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?;
-    t.insert(key, val)?;
-    Ok(QueryResult::with_message(format!(
-        "已插入 1 行到 '{}'。",
-        table
-    )))
+fn insert_str_str(target: WriteTarget<'_>, table: &str, key: &str, val: &str) -> CliResult<QueryResult> {
+    let msg = format!("已插入 1 行到 '{}'。", table);
+    match target {
+        WriteTarget::Database(db) => { let txn = db.begin_write()?; { let def = TableDefinition::<&str, &str>::new(table); let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?; t.insert(key, val)?; } finish(txn, Ok(QueryResult::with_message(msg))) }
+        WriteTarget::Transaction(txn) => { let def = TableDefinition::<&str, &str>::new(table); let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?; t.insert(key, val)?; Ok(QueryResult::with_message(msg)) }
+    }
 }
 
-// ── DELETE ──
+fn insert_str_bytes(target: WriteTarget<'_>, table: &str, key: &str, val: &[u8]) -> CliResult<QueryResult> {
+    let msg = format!("已插入 1 行到 '{}'。", table);
+    match target {
+        WriteTarget::Database(db) => { let txn = db.begin_write()?; { let def = TableDefinition::<&str, &[u8]>::new(table); let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?; t.insert(key, val)?; } finish(txn, Ok(QueryResult::with_message(msg))) }
+        WriteTarget::Transaction(txn) => { let def = TableDefinition::<&str, &[u8]>::new(table); let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?; t.insert(key, val)?; Ok(QueryResult::with_message(msg)) }
+    }
+}
 
-pub fn execute_delete(
-    db: &Database,
-    table_name: &str,
-    condition: &crate::parser::ast::Condition,
-) -> CliResult<QueryResult> {
+fn insert_bytes_key_val<V: Value + 'static>(target: WriteTarget<'_>, table: &str, key: &[u8], v: &V) -> CliResult<QueryResult>
+where for<'a> &'a V: Borrow<<V as Value>::SelfType<'a>>,
+{
+    match target {
+        WriteTarget::Database(db) => { let txn = db.begin_write()?; let r = insert_bytes_key_val_txn::<V>(&txn, table, key, v); finish(txn, r) }
+        WriteTarget::Transaction(txn) => insert_bytes_key_val_txn::<V>(txn, table, key, v),
+    }
+}
+fn insert_bytes_key_val_txn<V: Value + 'static>(txn: &WriteTransaction, table: &str, key: &[u8], v: &V) -> CliResult<QueryResult>
+where for<'a> &'a V: Borrow<<V as Value>::SelfType<'a>>,
+{
+    let def = TableDefinition::<&[u8], V>::new(table);
+    let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?;
+    t.insert(key, v)?;
+    Ok(QueryResult::with_message(format!("已插入 1 行到 '{}'。", table)))
+}
+
+fn insert_bytes_str(target: WriteTarget<'_>, table: &str, key: &[u8], val: &str) -> CliResult<QueryResult> {
+    let msg = format!("已插入 1 行到 '{}'。", table);
+    match target {
+        WriteTarget::Database(db) => { let txn = db.begin_write()?; { let def = TableDefinition::<&[u8], &str>::new(table); let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?; t.insert(key, val)?; } finish(txn, Ok(QueryResult::with_message(msg))) }
+        WriteTarget::Transaction(txn) => { let def = TableDefinition::<&[u8], &str>::new(table); let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?; t.insert(key, val)?; Ok(QueryResult::with_message(msg)) }
+    }
+}
+
+fn insert_bytes_bytes(target: WriteTarget<'_>, table: &str, key: &[u8], val: &[u8]) -> CliResult<QueryResult> {
+    let msg = format!("已插入 1 行到 '{}'。", table);
+    match target {
+        WriteTarget::Database(db) => { let txn = db.begin_write()?; { let def = TableDefinition::<&[u8], &[u8]>::new(table); let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?; t.insert(key, val)?; } finish(txn, Ok(QueryResult::with_message(msg))) }
+        WriteTarget::Transaction(txn) => { let def = TableDefinition::<&[u8], &[u8]>::new(table); let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?; t.insert(key, val)?; Ok(QueryResult::with_message(msg)) }
+    }
+}
+
+fn insert_owned_str<K: Key + 'static>(target: WriteTarget<'_>, table: &str, k: &K, val: &str) -> CliResult<QueryResult>
+where for<'a> &'a K: Borrow<<K as Value>::SelfType<'a>>,
+{
+    let msg = format!("已插入 1 行到 '{}'。", table);
+    match target {
+        WriteTarget::Database(db) => { let txn = db.begin_write()?; { let def = TableDefinition::<K, &str>::new(table); let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?; t.insert(k, val)?; } finish(txn, Ok(QueryResult::with_message(msg))) }
+        WriteTarget::Transaction(txn) => { let def = TableDefinition::<K, &str>::new(table); let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?; t.insert(k, val)?; Ok(QueryResult::with_message(msg)) }
+    }
+}
+
+fn insert_owned_bytes<K: Key + 'static>(target: WriteTarget<'_>, table: &str, k: &K, val: &[u8]) -> CliResult<QueryResult>
+where for<'a> &'a K: Borrow<<K as Value>::SelfType<'a>>,
+{
+    let msg = format!("已插入 1 行到 '{}'。", table);
+    match target {
+        WriteTarget::Database(db) => { let txn = db.begin_write()?; { let def = TableDefinition::<K, &[u8]>::new(table); let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?; t.insert(k, val)?; } finish(txn, Ok(QueryResult::with_message(msg))) }
+        WriteTarget::Transaction(txn) => { let def = TableDefinition::<K, &[u8]>::new(table); let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?; t.insert(k, val)?; Ok(QueryResult::with_message(msg)) }
+    }
+}
+
+// ── DELETE ─────────────────────────────────────────────────────────────────
+
+pub fn execute_delete(db: &Database, table_name: &str, condition: &crate::parser::ast::Condition) -> CliResult<QueryResult> {
     execute_delete_inner(WriteTarget::Database(db), table_name, condition)
 }
-
-pub fn execute_delete_in_txn(
-    txn: &WriteTransaction,
-    table_name: &str,
-    condition: &crate::parser::ast::Condition,
-) -> CliResult<QueryResult> {
+pub fn execute_delete_in_txn(txn: &WriteTransaction, table_name: &str, condition: &crate::parser::ast::Condition) -> CliResult<QueryResult> {
     execute_delete_inner(WriteTarget::Transaction(txn), table_name, condition)
 }
 
-fn execute_delete_inner(
-    target: WriteTarget<'_>,
-    table_name: &str,
-    condition: &crate::parser::ast::Condition,
-) -> CliResult<QueryResult> {
-    match condition {
-        crate::parser::ast::Condition::Equals(_, key_val) => match key_val {
-            Literal::Int(i) => {
-                let k = *i;
-                let sk = k.to_string();
-                if_ok!(target.try_delete::<i64, &str>(table_name, &k));
-                if_ok!(target.try_delete::<i64, i64>(table_name, &k));
-                if_ok!(target.try_delete::<i64, String>(table_name, &k));
-                if k >= 0 {
-                    if_ok!(target.try_delete::<u64, &str>(table_name, &(k as u64)));
-                    if_ok!(target.try_delete::<u64, String>(table_name, &(k as u64)));
-                }
-                if_ok!(target.try_delete_str_key(table_name, sk.as_str()));
-                if_ok!(target.try_delete::<String, &str>(table_name, &sk));
-                if_ok!(target.try_delete::<String, String>(table_name, &sk));
-                if_ok!(target.try_delete::<String, i64>(table_name, &sk));
-            }
-            Literal::String(s) => {
-                if_ok!(target.try_delete_str_key(table_name, s.as_str()));
-                if_ok!(target.try_delete::<String, &str>(table_name, s));
-                if_ok!(target.try_delete::<String, String>(table_name, s));
-                if_ok!(target.try_delete::<String, i64>(table_name, s));
-            }
-            _ => return Err(CliError::Engine("DELETE 仅支持整数或字符串键。".into())),
-        },
+fn execute_delete_inner(target: WriteTarget<'_>, table_name: &str, condition: &crate::parser::ast::Condition) -> CliResult<QueryResult> {
+    let key_val = match condition {
+        crate::parser::ast::Condition::Equals(_, v) => v,
         _ => return Err(CliError::Engine("DELETE 仅支持 WHERE key = <值>。".into())),
+    };
+    let sk = lit_to_string(key_val);
+
+    if let Some(r) = try_delete_str_key(target, table_name, sk.as_str()) { return r; }
+    if matches!(key_val, Literal::String(_)) {
+        if let Some(r) = try_delete_bytes_key(target, table_name, sk.as_bytes()) { return r; }
     }
-    Err(CliError::Engine(format!(
-        "无法在表 '{}' 中找到匹配的类型进行 DELETE。",
-        table_name
-    )))
+    if let Some(r) = try_delete_owned_ref_val(target, table_name, key_val) { return r; }
+
+    macro_rules! try_delete {
+        ($K:ty, $V:ty) => { if let Some(k) = <$K as OwnedFromLit>::from_lit(key_val) {
+            if_ok!(target.try_delete::<$K, $V>(table_name, &k));
+        }}
+    }
+    for_all_owned_table_types!(try_delete);
+
+    Err(CliError::Engine(format!("无法在表 '{}' 中找到匹配的类型进行 DELETE。", table_name)))
 }
 
-impl WriteTarget<'_> {
-    fn try_delete<K, V>(self, table: &str, key: &K) -> CliResult<QueryResult>
-    where
-        K: Key + 'static,
-        V: Value + 'static,
-        for<'a> &'a K: Borrow<<K as Value>::SelfType<'a>>,
-    {
-        match self {
-            WriteTarget::Database(db) => {
-                let txn = db.begin_write()?;
-                let result = delete_on_txn::<K, V>(&txn, table, key);
-                finish_auto_txn(txn, result)
-            }
-            WriteTarget::Transaction(txn) => delete_on_txn::<K, V>(txn, table, key),
-        }
-    }
-
-    fn try_delete_str_key(self, table: &str, key: &str) -> CliResult<QueryResult> {
-        // Try various value types with &str key
-        if_ok!(self.try_delete_str_key_val::<&str>(table, key));
-        if_ok!(self.try_delete_str_key_val::<i64>(table, key));
-        if_ok!(self.try_delete_str_key_val::<u64>(table, key));
-        if_ok!(self.try_delete_str_key_val::<String>(table, key));
-        Err(CliError::TypeMismatch(format!("表 '{}'", table)))
-    }
-
-    fn try_delete_str_key_val<V: Value + 'static>(
-        self,
-        table: &str,
-        key: &str,
-    ) -> CliResult<QueryResult> {
-        match self {
-            WriteTarget::Database(db) => {
-                let txn = db.begin_write()?;
-                let result = delete_str_key_val_on_txn::<V>(&txn, table, key);
-                finish_auto_txn(txn, result)
-            }
-            WriteTarget::Transaction(txn) => delete_str_key_val_on_txn::<V>(txn, table, key),
-        }
-    }
+fn try_delete_str_key(target: WriteTarget<'_>, table_name: &str, key: &str) -> Option<CliResult<QueryResult>> {
+    macro_rules! try_v { ($V:ty) => { if let Ok(r) = delete_str_key::<$V>(target, table_name, key) { return Some(Ok(r)); } } }
+    try_v!(&str); try_v!(i64); try_v!(u64); try_v!(f64); try_v!(bool); try_v!(&[u8]);
+    try_v!(i32); try_v!(u32); try_v!(f32); try_v!(i128); try_v!(u128); try_v!(String);
+    try_v!(i16); try_v!(u16); try_v!(i8); try_v!(u8);
+    None
 }
 
-fn delete_on_txn<K, V>(txn: &WriteTransaction, table: &str, key: &K) -> CliResult<QueryResult>
-where
-    K: Key + 'static,
-    V: Value + 'static,
-    for<'a> &'a K: Borrow<<K as Value>::SelfType<'a>>,
+fn try_delete_bytes_key(target: WriteTarget<'_>, table_name: &str, key: &[u8]) -> Option<CliResult<QueryResult>> {
+    macro_rules! try_v { ($V:ty) => { if let Ok(r) = delete_bytes_key::<$V>(target, table_name, key) { return Some(Ok(r)); } } }
+    try_v!(&[u8]); try_v!(&str); try_v!(i64); try_v!(u64); try_v!(String);
+    None
+}
+
+fn try_delete_owned_ref_val(target: WriteTarget<'_>, table_name: &str, key_val: &Literal) -> Option<CliResult<QueryResult>> {
+    macro_rules! try_k { ($K:ty) => { if let Some(k) = <$K as OwnedFromLit>::from_lit(key_val) {
+        if let Ok(r) = target.try_delete::<$K, &str>(table_name, &k) { return Some(Ok(r)); }
+        if let Ok(r) = target.try_delete::<$K, &[u8]>(table_name, &k) { return Some(Ok(r)); }
+    }}}
+    try_k!(String); try_k!(i64); try_k!(u64); try_k!(i32); try_k!(u32);
+    try_k!(bool); try_k!(i128); try_k!(u128); try_k!(i16); try_k!(i8);
+    None
+}
+
+fn delete_str_key<V: Value + 'static>(target: WriteTarget<'_>, table: &str, key: &str) -> CliResult<QueryResult> {
+    match target {
+        WriteTarget::Database(db) => { let txn = db.begin_write()?; let r = delete_str_key_txn::<V>(&txn, table, key); finish(txn, r) }
+        WriteTarget::Transaction(txn) => delete_str_key_txn::<V>(txn, table, key),
+    }
+}
+fn delete_str_key_txn<V: Value + 'static>(txn: &WriteTransaction, table: &str, key: &str) -> CliResult<QueryResult> {
+    let def = TableDefinition::<&str, V>::new(table);
+    let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?;
+    let existed = t.remove(key)?.is_some();
+    Ok(QueryResult::with_message(if existed { format!("已从 '{}' 删除 1 行。", table) } else { format!("在 '{}' 中未找到匹配的行。", table) }))
+}
+
+fn delete_bytes_key<V: Value + 'static>(target: WriteTarget<'_>, table: &str, key: &[u8]) -> CliResult<QueryResult> {
+    match target {
+        WriteTarget::Database(db) => { let txn = db.begin_write()?; let r = delete_bytes_key_txn::<V>(&txn, table, key); finish(txn, r) }
+        WriteTarget::Transaction(txn) => delete_bytes_key_txn::<V>(txn, table, key),
+    }
+}
+fn delete_bytes_key_txn<V: Value + 'static>(txn: &WriteTransaction, table: &str, key: &[u8]) -> CliResult<QueryResult> {
+    let def = TableDefinition::<&[u8], V>::new(table);
+    let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?;
+    let existed = t.remove(key)?.is_some();
+    Ok(QueryResult::with_message(if existed { format!("已从 '{}' 删除 1 行。", table) } else { format!("在 '{}' 中未找到匹配的行。", table) }))
+}
+
+fn delete_txn<K: Key + 'static, V: Value + 'static>(txn: &WriteTransaction, table: &str, key: &K) -> CliResult<QueryResult>
+where for<'a> &'a K: Borrow<<K as Value>::SelfType<'a>>,
 {
-    let existed = {
-        let def = TableDefinition::<K, V>::new(table);
-        let mut t = txn
-            .open_table(def)
-            .map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?;
-        let removed = t.remove(key)?;
-        removed.is_some()
-    };
-    Ok(QueryResult::with_message(if existed {
-        format!("已从 '{}' 删除 1 行。", table)
-    } else {
-        format!("在 '{}' 中未找到匹配的行。", table)
-    }))
+    let def = TableDefinition::<K, V>::new(table);
+    let mut t = txn.open_table(def).map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?;
+    let existed = t.remove(key)?.is_some();
+    Ok(QueryResult::with_message(if existed { format!("已从 '{}' 删除 1 行。", table) } else { format!("在 '{}' 中未找到匹配的行。", table) }))
 }
 
-/// 带 &str 键的泛型值类型 DELETE
-fn delete_str_key_val_on_txn<V: Value + 'static>(
-    txn: &WriteTransaction,
-    table: &str,
-    key: &str,
-) -> CliResult<QueryResult> {
-    let existed = {
-        let def = TableDefinition::<&str, V>::new(table);
-        let mut t = txn
-            .open_table(def)
-            .map_err(|_| CliError::TypeMismatch(format!("表 '{}'", table)))?;
-        let removed = t.remove(key)?;
-        removed.is_some()
-    };
-    Ok(QueryResult::with_message(if existed {
-        format!("已从 '{}' 删除 1 行。", table)
-    } else {
-        format!("在 '{}' 中未找到匹配的行。", table)
-    }))
-}
-
-macro_rules! if_ok {
-    ($e:expr) => {
-        match $e {
-            Ok(r) => return Ok(r),
-            Err(_) => {}
-        }
-    };
-}
+macro_rules! if_ok { ($e:expr) => { match $e { Ok(r) => return Ok(r), Err(_) => {} } }; }
 use if_ok;

@@ -1,3 +1,8 @@
+//! 数据查询 (SELECT / DESCRIBE)。
+//!
+//! 通过 `for_all_table_types!` 和 `for_all_multimap_types!` 遍历
+//! 全部受支持的类型组合，保证与 INSERT / DELETE 覆盖范围一致。
+
 use redb::{
     Database, MultimapTableDefinition, MultimapTableHandle, ReadableDatabase,
     ReadableMultimapTable, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
@@ -5,8 +10,9 @@ use redb::{
 
 use crate::error::{CliError, CliResult};
 use crate::parser::ast::{Condition, Literal, OrderBy, OrderDirection};
+use crate::for_all_table_types;
+use crate::for_all_multimap_types;
 
-/// 表格行数据。每个内层 Vec 对应一行的全部列。
 pub type Row = Vec<String>;
 
 #[derive(Debug)]
@@ -62,7 +68,7 @@ fn table_exists(db: &Database, table: &str) -> bool {
     false
 }
 
-// ── execute_select ──
+// ── SELECT ─────────────────────────────────────────────────────────────────
 
 pub fn execute_select(
     db: &Database,
@@ -75,9 +81,10 @@ pub fn execute_select(
 ) -> CliResult<QueryResult> {
     validate_select_options(condition, order_by)?;
 
+    // 遍历全部表类型组合——与 INSERT / DELETE 使用同一份权威列表
     macro_rules! attempt {
-        ($k:ty, $v:ty) => {
-            match try_open_typed::<$k, $v>(
+        ($K:ty, $V:ty) => {
+            match try_open_typed::<$K, $V>(
                 db, table_name, condition, order_by, limit, offset, count_only,
             ) {
                 Ok(r) => return Ok(r),
@@ -89,116 +96,12 @@ pub fn execute_select(
         };
     }
 
-    // ─ 键 = &str (redb 4.x 新增 Key 实现) ─
-    attempt!(&str, &str);
-    attempt!(&str, i64);
-    attempt!(&str, u64);
-    attempt!(&str, f64);
-    attempt!(&str, bool);
-    attempt!(&str, &[u8]);
-    attempt!(&str, i32);
-    attempt!(&str, u32);
-    attempt!(&str, f32);
-    attempt!(&str, i128);
-    attempt!(&str, u128);
-    attempt!(&str, String);
-    attempt!(&str, i16);
-    attempt!(&str, u16);
-    attempt!(&str, i8);
-    attempt!(&str, u8);
+    for_all_table_types!(attempt);
 
-    // ─ 键 = &[u8] (redb 4.x 新增 Key 实现) ─
-    attempt!(&[u8], &[u8]);
-    attempt!(&[u8], &str);
-    attempt!(&[u8], i64);
-    attempt!(&[u8], u64);
-    attempt!(&[u8], String);
-
-    // ─ 键 = String ─
-    attempt!(String, &str);
-    attempt!(String, i64);
-    attempt!(String, u64);
-    attempt!(String, f64);
-    attempt!(String, bool);
-    attempt!(String, &[u8]);
-    attempt!(String, i32);
-    attempt!(String, u32);
-    attempt!(String, f32);
-    attempt!(String, i128);
-    attempt!(String, u128);
-    attempt!(String, String);
-    attempt!(String, i16);
-    attempt!(String, u16);
-    attempt!(String, i8);
-    attempt!(String, u8);
-
-    // ─ 键 = i64 ─
-    attempt!(i64, &str);
-    attempt!(i64, i64);
-    attempt!(i64, u64);
-    attempt!(i64, f64);
-    attempt!(i64, bool);
-    attempt!(i64, &[u8]);
-    attempt!(i64, i32);
-    attempt!(i64, u32);
-    attempt!(i64, String);
-    attempt!(i64, i128);
-    attempt!(i64, i16);
-    attempt!(i64, i8);
-    attempt!(i64, f32);
-    attempt!(i64, u8);
-
-    // ─ 键 = u64 ─
-    attempt!(u64, &str);
-    attempt!(u64, i64);
-    attempt!(u64, u64);
-    attempt!(u64, f64);
-    attempt!(u64, bool);
-    attempt!(u64, &[u8]);
-    attempt!(u64, i32);
-    attempt!(u64, u32);
-    attempt!(u64, String);
-    attempt!(u64, f32);
-
-    // ─ 键 = i32 ─
-    attempt!(i32, &str);
-    attempt!(i32, i32);
-    attempt!(i32, i64);
-    attempt!(i32, u64);
-    attempt!(i32, bool);
-    attempt!(i32, String);
-
-    // ─ 键 = u32 ─
-    attempt!(u32, u32);
-    attempt!(u32, &str);
-    attempt!(u32, i64);
-    attempt!(u32, u64);
-    attempt!(u32, String);
-
-    // ─ 键 = bool ─
-    attempt!(bool, bool);
-    attempt!(bool, i64);
-    attempt!(bool, &str);
-    attempt!(bool, u64);
-    attempt!(bool, String);
-
-    // ─ 键 = i128 / u128 ─
-    attempt!(i128, i128);
-    attempt!(i128, &str);
-    attempt!(u128, u128);
-    attempt!(u128, &str);
-
-    // ─ 键 = i16 / u16 / i8 / u8 ─
-    attempt!(i16, i16);
-    attempt!(i16, &str);
-    attempt!(u16, u16);
-    attempt!(i8, i8);
-    attempt!(u8, u8);
-
-    // ─ Multimap ─
+    // 再遍历 Multimap 类型组合
     macro_rules! attempt_mm {
-        ($k:ty, $v:ty) => {
-            match mm_open_typed::<$k, $v>(
+        ($K:ty, $V:ty) => {
+            match mm_open_typed::<$K, $V>(
                 db, table_name, condition, order_by, limit, offset, count_only,
             ) {
                 Ok(r) => return Ok(r),
@@ -209,19 +112,9 @@ pub fn execute_select(
             }
         };
     }
-    attempt_mm!(&str, &str);
-    attempt_mm!(String, &str);
-    attempt_mm!(i64, &str);
-    attempt_mm!(i64, i64);
-    attempt_mm!(&str, i64);
-    attempt_mm!(String, i64);
-    attempt_mm!(u64, u64);
-    attempt_mm!(u64, &str);
-    attempt_mm!(i64, &[u8]);
-    attempt_mm!(String, String);
-    attempt_mm!(&str, &[u8]);
 
-    // ─ 所有尝试均失败 ─
+    for_all_multimap_types!(attempt_mm);
+
     if table_exists(db, table_name) {
         Err(CliError::Engine(format!(
             "表 '{}' 存在，但其键/值类型组合未被当前版本支持。\n\
@@ -232,8 +125,6 @@ pub fn execute_select(
         Err(CliError::TableNotFound(table_name.to_string()))
     }
 }
-
-// ── 带类型的打开辅助函数 ──
 
 fn try_open_typed<K: redb::Key + 'static, V: redb::Value + 'static>(
     db: &Database,
@@ -305,6 +196,8 @@ fn mm_open_typed<K: redb::Key + 'static, V: redb::Key + 'static>(
     Ok(rows_to_result(rows, order_by, limit, offset, count_only))
 }
 
+// ── 辅助类型与逻辑 ──
+
 #[derive(Debug)]
 struct ScannedRow {
     key: String,
@@ -315,7 +208,6 @@ impl ScannedRow {
     fn new(key: String, value: String) -> Self {
         Self { key, value }
     }
-
     fn into_row(self) -> Row {
         vec![self.key, self.value]
     }
@@ -364,11 +256,9 @@ fn rows_to_result(
     if matches!(order_by.map(|o| &o.direction), Some(OrderDirection::Desc)) {
         rows.reverse();
     }
-
     if count_only {
         return QueryResult::count_only(rows.len() as u64);
     }
-
     let offset = offset.unwrap_or(0) as usize;
     let limit = limit.map(|v| v as usize).unwrap_or(usize::MAX);
     let rows = rows
@@ -433,95 +323,28 @@ fn compare_literal(key: &str, literal: &Literal) -> Option<std::cmp::Ordering> {
     }
 }
 
-// ── DESCRIBE ──
+fn clean_debug(v: impl std::fmt::Debug) -> String {
+    let s = format!("{:?}", v);
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s
+    }
+}
+
+// ── DESCRIBE ───────────────────────────────────────────────────────────────
 
 pub fn execute_describe(db: &Database, table_name: &str) -> CliResult<QueryResult> {
     macro_rules! try_d {
-        ($k:ty, $v:ty) => {
-            match describe_typed::<$k, $v>(db, table_name) {
+        ($K:ty, $V:ty) => {
+            match describe_typed::<$K, $V>(db, table_name) {
                 Ok(r) => return Ok(r),
                 Err(_) => {}
             }
         };
     }
 
-    try_d!(&str, &str);
-    try_d!(&str, i64);
-    try_d!(&str, u64);
-    try_d!(&str, f64);
-    try_d!(&str, bool);
-    try_d!(&str, &[u8]);
-    try_d!(&str, i32);
-    try_d!(&str, u32);
-    try_d!(&str, f32);
-    try_d!(&str, String);
-    try_d!(&[u8], &[u8]);
-    try_d!(&[u8], &str);
-    try_d!(&[u8], i64);
-    try_d!(&[u8], u64);
-    try_d!(&[u8], String);
-    try_d!(String, &str);
-    try_d!(String, i64);
-    try_d!(String, u64);
-    try_d!(String, f64);
-    try_d!(String, bool);
-    try_d!(String, &[u8]);
-    try_d!(String, i32);
-    try_d!(String, u32);
-    try_d!(String, f32);
-    try_d!(String, i128);
-    try_d!(String, u128);
-    try_d!(String, String);
-    try_d!(String, i16);
-    try_d!(String, u16);
-    try_d!(String, i8);
-    try_d!(String, u8);
-    try_d!(i64, &str);
-    try_d!(i64, i64);
-    try_d!(i64, u64);
-    try_d!(i64, f64);
-    try_d!(i64, bool);
-    try_d!(i64, &[u8]);
-    try_d!(i64, i32);
-    try_d!(i64, u32);
-    try_d!(i64, String);
-    try_d!(i64, i128);
-    try_d!(i64, i16);
-    try_d!(i64, i8);
-    try_d!(u64, &str);
-    try_d!(u64, i64);
-    try_d!(u64, u64);
-    try_d!(u64, f64);
-    try_d!(u64, bool);
-    try_d!(u64, &[u8]);
-    try_d!(u64, i32);
-    try_d!(u64, u32);
-    try_d!(u64, String);
-    try_d!(i32, &str);
-    try_d!(i32, i32);
-    try_d!(i32, i64);
-    try_d!(i32, u64);
-    try_d!(i32, bool);
-    try_d!(i32, String);
-    try_d!(u32, u32);
-    try_d!(u32, &str);
-    try_d!(u32, i64);
-    try_d!(u32, u64);
-    try_d!(u32, String);
-    try_d!(bool, bool);
-    try_d!(bool, i64);
-    try_d!(bool, &str);
-    try_d!(bool, u64);
-    try_d!(bool, String);
-    try_d!(i128, i128);
-    try_d!(i128, &str);
-    try_d!(u128, u128);
-    try_d!(u128, &str);
-    try_d!(i16, i16);
-    try_d!(i16, &str);
-    try_d!(u16, u16);
-    try_d!(i8, i8);
-    try_d!(u8, u8);
+    for_all_table_types!(try_d);
 
     if !table_exists(db, table_name) {
         return Err(CliError::TableNotFound(table_name.into()));
@@ -530,17 +353,6 @@ pub fn execute_describe(db: &Database, table_name: &str) -> CliResult<QueryResul
         "表 '{}' 存在，但其类型组合无法识别。可能使用了复合类型（元组/数组/Option 等）。",
         table_name
     )))
-}
-
-/// 格式化值：用 Debug 但去掉字符串的外层引号
-fn clean_debug(v: impl std::fmt::Debug) -> String {
-    let s = format!("{:?}", v);
-    // 去掉 &str / String 的 Debug 引号包裹
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s
-    }
 }
 
 fn describe_typed<K: redb::Key + 'static, V: redb::Value + 'static>(
@@ -558,6 +370,8 @@ fn describe_typed<K: redb::Key + 'static, V: redb::Value + 'static>(
         count
     )))
 }
+
+// ── 测试 ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

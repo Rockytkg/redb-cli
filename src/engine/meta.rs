@@ -68,13 +68,14 @@ pub fn execute_info(db: &Database) -> CliResult<QueryResult> {
     Ok(QueryResult::with_message(lines.join("\n")))
 }
 
-/// .compact — 压缩数据库
-pub fn execute_compact(db: &Database) -> CliResult<QueryResult> {
-    let txn = db.begin_write()?;
-    txn.commit()?;
-    Ok(QueryResult::with_message(
-        "写事务已提交——碎片页将在后续压缩中回收。".into(),
-    ))
+/// .compact — 压缩数据库，回收碎片空间
+pub fn execute_compact(db: &mut Database) -> CliResult<QueryResult> {
+    let compacted = db.compact()?;
+    Ok(QueryResult::with_message(if compacted {
+        "数据库压缩完成——碎片空间已回收。".into()
+    } else {
+        "数据库无需进一步压缩。".into()
+    }))
 }
 
 fn format_bytes(bytes: u64) -> String {
